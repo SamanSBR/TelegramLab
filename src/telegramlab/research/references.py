@@ -148,21 +148,27 @@ def extract_message_references(
     *,
     origin_message_id: int,
     discovered_at: str,
-) -> tuple[list[ReferenceOccurrence], int]:
+) -> tuple[list[ReferenceOccurrence], int, int]:
     """Extract occurrences from one message; URLs are never visited.
 
-    Returns observations grouped by type/target for that message and a count of
-    private invitation links omitted from output and persistence.
+    Returns observations grouped by type/target, the number of private invite
+    links omitted, and malformed URL references skipped. One bad URL never
+    discards other valid observations from the message.
     """
     text = text or ""
     url_occurrences = extract_url_occurrences(text, entities)
     counts: dict[tuple[str, str, str, str, str], int] = {}
     url_spans: list[tuple[int, int]] = []
     omitted_invites = 0
+    invalid_references = 0
     for raw_url, start, end in url_occurrences:
         url_spans.append((start, end))
-        classified = normalize_reference_url(raw_url)
+        try:
+            classified = normalize_reference_url(raw_url)
+        except (TypeError, ValueError, UnicodeError):
+            classified = None
         if classified is None:
+            invalid_references += 1
             continue
         reference_type, target, provider, candidate_type = classified
         if reference_type == "private_invite_omitted":
@@ -194,4 +200,4 @@ def extract_message_references(
         )
         for (reference_type, target, provider, candidate_type, identifier), count in sorted(counts.items())
     ]
-    return observations, omitted_invites
+    return observations, omitted_invites, invalid_references

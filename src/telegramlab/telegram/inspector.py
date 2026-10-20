@@ -92,6 +92,10 @@ def normalize_target(target: str) -> str:
         return raw
     if raw.startswith("@"):
         username = raw[1:]
+    elif _USERNAME_RE.fullmatch(raw):
+        # Accept a bare public username too. This also makes canonical
+        # usernames returned by normalize_target safe to normalize again.
+        username = raw
     else:
         candidate = raw if "://" in raw else f"https://{raw}"
         try:

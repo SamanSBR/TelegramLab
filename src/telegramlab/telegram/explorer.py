@@ -29,6 +29,7 @@ class ExplorationResult:
     messages_inspected: int
     unique_references: int
     total_occurrences: int
+    invalid_references_skipped: int
     references: list[dict[str, Any]]
     warnings: list[str]
     completion_status: str = "completed"
@@ -105,12 +106,14 @@ async def explore_source(
     explored_at = _now()
     observations: list[ReferenceOccurrence] = []
     omitted_invites = 0
+    invalid_references_skipped = 0
     for message_id, text, entities in messages:
-        found, omitted = extract_message_references(
+        found, omitted, invalid = extract_message_references(
             text, entities, origin_message_id=message_id, discovered_at=explored_at
         )
         observations.extend(found)
         omitted_invites += omitted
+        invalid_references_skipped += invalid
     messages_inspected = len(messages)
     messages.clear()
 
@@ -134,7 +137,11 @@ async def explore_source(
             "occurrence_count": item.occurrence_count,
         })
     references = [grouped[key] for key in sorted(grouped)]
-    warnings = ["Private Telegram invite links were omitted." ] if omitted_invites else []
+    warnings = []
+    if omitted_invites:
+        warnings.append(f"Omitted {omitted_invites} private Telegram invite reference(s).")
+    if invalid_references_skipped:
+        warnings.append(f"Skipped {invalid_references_skipped} malformed reference(s); other references were retained.")
     report("[4/4] Summarizing and optionally saving candidates")
 
     registry_summary: dict[str, int] | None = None
@@ -170,6 +177,7 @@ async def explore_source(
         messages_inspected=messages_inspected,
         unique_references=len(references),
         total_occurrences=sum(item["occurrence_count"] for item in references),
+        invalid_references_skipped=invalid_references_skipped,
         references=references,
         warnings=warnings,
         registry_summary=registry_summary,

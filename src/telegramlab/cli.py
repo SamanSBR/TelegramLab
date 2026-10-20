@@ -380,7 +380,8 @@ def _run_explore(args: argparse.Namespace) -> int:
                 "source_identity": {"provider": "telegram", "requested": args.target},
                 "explored_at": datetime.now(UTC).isoformat(timespec="seconds"),
                 "limit": args.limit, "messages_inspected": 0,
-                "unique_references": 0, "total_occurrences": 0, "references": [],
+                "unique_references": 0, "total_occurrences": 0,
+                "invalid_references_skipped": 0, "references": [],
                 "warnings": [str(error)], "completion_status": "failed",
             }))
         else:
@@ -393,7 +394,8 @@ def _run_explore(args: argparse.Namespace) -> int:
                 "source_identity": {"provider": "telegram", "requested": args.target},
                 "explored_at": datetime.now(UTC).isoformat(timespec="seconds"),
                 "limit": args.limit, "messages_inspected": 0,
-                "unique_references": 0, "total_occurrences": 0, "references": [],
+                "unique_references": 0, "total_occurrences": 0,
+                "invalid_references_skipped": 0, "references": [],
                 "warnings": [message], "completion_status": "failed",
             }))
         else:

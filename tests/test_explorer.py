@@ -14,7 +14,7 @@ from telegramlab.cli import build_parser
 from telegramlab.research.references import extract_message_references, normalize_reference_url
 from telegramlab.sources.registry import add_source, get_source
 from telegramlab.telegram.explorer import explore_source
-from telegramlab.telegram.inspector import FloodWaitInspectionError, InspectionError, NetworkInspectionError
+from telegramlab.telegram.inspector import FloodWaitInspectionError, InspectionError, NetworkInspectionError, normalize_target
 
 
 def _channel():
@@ -37,6 +37,16 @@ class FakeClient:
         self.request_limit = None
         self.consumed = 0
         self.resolved = None
+        self.connected = False
+
+    async def connect(self):
+        self.connected = True
+
+    async def is_user_authorized(self):
+        return True
+
+    async def disconnect(self):
+        self.connected = False
 
     async def get_entity(self, target):
         self.resolved = target
@@ -87,7 +97,7 @@ def test_reference_extraction_counts_duplicates_and_preserves_types():
         "https://github.com/OpenAI/Repo/issues/4 https://gitlab.com/team/project/-/tree/main "
         "https://example.org/sub?token=do-not-leak"
     )
-    observations, omitted = extract_message_references(
+    observations, omitted, invalid = extract_message_references(
         text, None, origin_message_id=11, discovered_at="2026-01-01T12:00:00+00:00"
     )
     grouped = {(item.reference_type, item.normalized_target): item for item in observations}
@@ -101,10 +111,11 @@ def test_reference_extraction_counts_duplicates_and_preserves_types():
     assert "do-not-leak" not in subscription.normalized_target
     assert "%5BREDACTED%5D" in subscription.normalized_target
     assert omitted == 0
+    assert invalid == 0
 
 
 def test_ambiguous_telegram_username_references_remain_distinct():
-    observations, _ = extract_message_references(
+    observations, _, _ = extract_message_references(
         "@ExampleChannel https://t.me/ExampleChannel", None,
         origin_message_id=3, discovered_at="2026-01-01T12:00:00+00:00",
     )
@@ -123,7 +134,7 @@ def test_url_entities_unicode_and_entity_text_links_are_explored():
         MessageEntityUrl(offset=offset, length=length),
         MessageEntityTextUrl(offset=0, length=2, url="https://gitlab.com/team/project"),
     ]
-    observations, _ = extract_message_references(
+    observations, _, _ = extract_message_references(
         text, entities, origin_message_id=4, discovered_at="2026-01-01T12:00:00+00:00"
     )
     assert {item.normalized_target for item in observations} == {
@@ -132,12 +143,62 @@ def test_url_entities_unicode_and_entity_text_links_are_explored():
 
 
 def test_private_invite_links_are_omitted():
-    observations, omitted = extract_message_references(
+    observations, omitted, invalid = extract_message_references(
         "Invite https://t.me/+SecretInviteCode", None,
         origin_message_id=7, discovered_at="2026-01-01T12:00:00+00:00",
     )
     assert observations == []
     assert omitted == 1
+    assert invalid == 0
+
+
+@pytest.mark.parametrize("target", [
+    "@zenmaxai", "zenmaxai", "t.me/zenmaxai", "https://t.me/zenmaxai",
+])
+def test_source_username_normalization_is_consistent_and_idempotent(target):
+    normalized = normalize_target(target)
+    assert normalized == "zenmaxai"
+    assert normalize_target(normalized) == normalized
+
+
+def test_explorer_accepts_all_source_username_forms_with_mock_client():
+    for target in ("@zenmaxai", "zenmaxai", "t.me/zenmaxai", "https://t.me/zenmaxai"):
+        client = FakeClient([_message(1, "https://github.com/OpenAI/Repo")])
+        result = asyncio.run(explore_source(client, target, progress=None))
+        assert client.resolved == "zenmaxai"
+        assert result.unique_references == 1
+
+
+def test_explore_cli_wrapper_double_normalization_regression(monkeypatch):
+    client = FakeClient([_message(1, "https://github.com/OpenAI/Repo")])
+    settings = SimpleNamespace(session_path="unused", api_id=1, api_hash="mock")
+    monkeypatch.setattr(cli.Settings, "from_env", staticmethod(lambda: settings))
+    monkeypatch.setattr(cli, "require_existing_session", lambda _path: None)
+    monkeypatch.setattr(cli, "create_client", lambda _settings: client)
+    result = asyncio.run(cli._explore_with_existing_session(
+        "@zenmaxai", 100, False, None, None
+    ))
+    assert client.resolved == "zenmaxai"
+    assert result.messages_inspected == 1
+    assert not client.connected
+
+
+def test_malformed_extracted_url_is_counted_without_dropping_valid_reference():
+    observations, omitted, invalid = extract_message_references(
+        "bad https://[broken and good https://github.com/OpenAI/Repo", None,
+        origin_message_id=9, discovered_at="2026-01-01T12:00:00+00:00",
+    )
+    assert omitted == 0
+    assert invalid == 1
+    assert [item.normalized_target for item in observations] == ["https://github.com/openai/repo"]
+
+
+def test_explorer_reports_malformed_reference_count_and_keeps_valid_findings():
+    client = FakeClient([_message(10, "https://[broken https://github.com/OpenAI/Repo")])
+    result = asyncio.run(explore_source(client, "@zenmaxai", progress=None))
+    assert result.invalid_references_skipped == 1
+    assert result.references[0]["normalized_target"] == "https://github.com/openai/repo"
+    assert "Skipped 1 malformed reference" in result.warnings[0]
 
 
 def test_explore_counts_occurrences_and_provenance_without_following_urls():
