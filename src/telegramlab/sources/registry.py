@@ -123,6 +123,11 @@ def normalize_telegram_identifier(identifier: str) -> tuple[str, str | None, str
 
 def _normalize_identity(provider: str, identifier: str) -> tuple[str, str | None, str]:
     if provider == "telegram":
+        if identifier.startswith("telegram-id:"):
+            numeric_id = identifier.removeprefix("telegram-id:")
+            if not re.fullmatch(r"-?\d{1,20}", numeric_id):
+                raise RegistryError("Telegram numeric identifiers must contain only a signed numeric ID.")
+            return identifier, None, identifier
         return normalize_telegram_identifier(identifier)
     raw = identifier.strip()
     if not raw:
@@ -399,3 +404,125 @@ def to_json(value: object) -> str:
     elif isinstance(value, list):
         value = [asdict(item) if isinstance(item, (Source, SourceRelationship)) else item for item in value]
     return json.dumps(value, indent=2, ensure_ascii=False)
+
+
+def save_inspection_record(
+    path: Path,
+    *,
+    identifier: str,
+    source_type: str,
+    metadata: dict[str, object],
+    inspected_at: str,
+    limit: int,
+    findings: dict[str, object],
+    warnings: list[str],
+) -> int:
+    """Additively migrate and atomically save non-content inspection metadata."""
+    provider = "telegram"
+    source_type = _slug(source_type, "source type")
+    normalized_identifier, canonical_url, identity_key = _normalize_identity(provider, identifier)
+    platform_id = str(metadata.get("telegram_id") or "").strip()
+    if not platform_id:
+        raise RegistryError("Telegram did not provide a stable numeric ID; inspection was not saved.")
+    display_name = str(metadata.get("title") or "").strip() or None
+    description = str(metadata.get("description") or "").strip() or None
+    if identifier.startswith("telegram-id:"):
+        canonical_url = None
+
+    initialize_database(path)
+    db = sqlite3.connect(path)
+    db.row_factory = sqlite3.Row
+    db.execute("PRAGMA foreign_keys = ON")
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        # Migration 1 is additive: record versions and create inspection summaries.
+        db.execute("""CREATE TABLE IF NOT EXISTS schema_migrations (
+            version INTEGER PRIMARY KEY,
+            applied_at TEXT NOT NULL
+        )""")
+        applied = {row[0] for row in db.execute("SELECT version FROM schema_migrations")}
+        if 1 not in applied:
+            db.execute("""CREATE TABLE IF NOT EXISTS inspection_runs (
+                id INTEGER PRIMARY KEY,
+                source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                inspected_at TEXT NOT NULL,
+                message_limit INTEGER NOT NULL,
+                messages_inspected INTEGER NOT NULL,
+                messages_containing_urls INTEGER NOT NULL,
+                messages_containing_telegram_references INTEGER NOT NULL,
+                messages_containing_external_urls INTEGER NOT NULL,
+                messages_containing_vless_candidates INTEGER NOT NULL,
+                messages_containing_shadowsocks_candidates INTEGER NOT NULL,
+                earliest_message_date TEXT,
+                latest_message_date TEXT,
+                warnings_json TEXT NOT NULL,
+                completion_status TEXT NOT NULL
+            )""")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_inspection_runs_source_time "
+                       "ON inspection_runs(source_id, inspected_at)")
+            db.execute("INSERT INTO schema_migrations(version, applied_at) VALUES (1, ?)", (_now(),))
+
+        identity_rows = db.execute(
+            "SELECT id, source_type, platform_id FROM sources WHERE provider=? AND identity_key=?",
+            (provider, identity_key),
+        ).fetchall()
+        if any(row["platform_id"] and row["platform_id"] != platform_id for row in identity_rows):
+            raise RegistryError(
+                "Identity conflict: this Telegram username is already associated with a different numeric ID."
+            )
+        existing = next((row for row in identity_rows if row["source_type"] == source_type), None)
+        if identifier.startswith("telegram-id:") and existing is None:
+            existing = db.execute(
+                "SELECT id, source_type, platform_id FROM sources "
+                "WHERE provider=? AND source_type=? AND platform_id=? ORDER BY id LIMIT 1",
+                (provider, source_type, platform_id),
+            ).fetchone()
+        if existing is None:
+            now = _now()
+            cursor = db.execute("""INSERT INTO sources
+                (provider, source_type, identifier, identity_key, canonical_url, display_name,
+                 description, discovery_method, discovered_from, discovered_at, last_checked_at,
+                 status, research_category, notes, created_at, updated_at, platform_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'manually_added', NULL, ?, ?, 'candidate',
+                        'general', NULL, ?, ?, ?)""",
+                (provider, source_type, normalized_identifier, identity_key, canonical_url,
+                 display_name, description, inspected_at, inspected_at, now, now, platform_id))
+            source_id = int(cursor.lastrowid)
+        else:
+            source_id = int(existing["id"])
+            db.execute("""UPDATE sources SET
+                canonical_url=COALESCE(NULLIF(canonical_url,''), ?),
+                display_name=COALESCE(NULLIF(display_name,''), ?),
+                description=COALESCE(NULLIF(description,''), ?),
+                platform_id=COALESCE(NULLIF(platform_id,''), ?),
+                last_checked_at=?, updated_at=?
+                WHERE id=?""",
+                (canonical_url, display_name, description, platform_id, inspected_at, _now(), source_id))
+
+        db.execute("""INSERT INTO inspection_runs
+            (source_id, inspected_at, message_limit, messages_inspected,
+             messages_containing_urls, messages_containing_telegram_references,
+             messages_containing_external_urls, messages_containing_vless_candidates,
+             messages_containing_shadowsocks_candidates, earliest_message_date,
+             latest_message_date, warnings_json, completion_status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed')""",
+            (source_id, inspected_at, limit,
+             int(findings["messages_inspected"]),
+             int(findings["messages_containing_urls"]),
+             int(findings["messages_containing_telegram_references"]),
+             int(findings["messages_containing_external_urls"]),
+             int(findings["messages_containing_vless_candidates"]),
+             int(findings["messages_containing_shadowsocks_candidates"]),
+             findings.get("earliest_inspected_message_date"),
+             findings.get("latest_inspected_message_date"),
+             json.dumps(warnings, ensure_ascii=False)))
+        db.commit()
+        return source_id
+    except sqlite3.IntegrityError as error:
+        db.rollback()
+        raise RegistryError(f"Inspection summary could not be saved: {error}.") from None
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()

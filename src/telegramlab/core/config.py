@@ -6,6 +6,13 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+
+
+def _project_path(raw_value: str | None, default: Path) -> Path:
+    path = Path(raw_value).expanduser() if raw_value else default
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
 
 @dataclass(frozen=True, slots=True)
 class Settings:
@@ -20,15 +27,14 @@ class Settings:
     @classmethod
     def from_env(cls) -> "Settings":
         """Read settings without requiring credentials for offline commands."""
-        root = Path.cwd()
         raw_api_id = os.environ.get("TG_API_ID")
         raw_api_hash = os.environ.get("TG_API_HASH")
         return cls(
-            database_path=Path(os.environ.get("TELEGRAMLAB_DB_PATH", root / "telegram_lab.db")).expanduser(),
-            sources_database_path=Path(
-                os.environ.get("TELEGRAMLAB_SOURCES_DB_PATH", root / "data" / "sources.db")
-            ).expanduser(),
-            session_path=Path(os.environ.get("TELEGRAMLAB_SESSION_PATH", root / "telegram_lab")).expanduser(),
+            database_path=_project_path(os.environ.get("TELEGRAMLAB_DB_PATH"), PROJECT_ROOT / "telegram_lab.db"),
+            sources_database_path=_project_path(
+                os.environ.get("TELEGRAMLAB_SOURCES_DB_PATH"), PROJECT_ROOT / "data" / "sources.db"
+            ),
+            session_path=_project_path(os.environ.get("TELEGRAMLAB_SESSION_PATH"), PROJECT_ROOT / "telegram_lab"),
             api_id=int(raw_api_id) if raw_api_id else None,
             api_hash=raw_api_hash or None,
         )

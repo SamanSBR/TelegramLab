@@ -12,7 +12,7 @@ python -m venv .venv
 python -m pip install -e '.[dev]'
 ```
 
-Telegram authentication continues to use the existing `telegram_lab.session` basename in the current working directory by default. Telegram credentials are optional for offline commands and are read from `TG_API_ID` and `TG_API_HASH` only when a future Telegram operation is requested. Local paths can be set with `TELEGRAMLAB_DB_PATH` and `TELEGRAMLAB_SESSION_PATH`.
+Telegram authentication continues to use the existing `telegram_lab.session` basename in the project directory by default. Telegram credentials are optional for offline commands and are read from `TG_API_ID` and `TG_API_HASH` only for inspection. Local paths can be set with `TELEGRAMLAB_DB_PATH`, `TELEGRAMLAB_SOURCES_DB_PATH`, and `TELEGRAMLAB_SESSION_PATH`; relative paths resolve from the project directory.
 
 ## Architecture
 
@@ -44,6 +44,21 @@ telegramlab source stats
 ```
 
 Append `--json` to supported source commands for JSON output. Telegram public username inputs such as `@ExampleChannel`, `https://t.me/ExampleChannel`, and `t.me/ExampleChannel` normalize to the same username identity within a provider and source type. This does not verify availability or permanence. A separately supplied `platform_id` is available for a stable provider identifier legitimately obtained later. The registry does not visit URLs, access Telegram, join private sources, infer relationships, or collect content. Relationships can be recorded through the registry API only when an evidence reference is supplied; relationship types are extensible slugs.
+
+### Read-only Telegram inspection
+
+The inspector reads one explicitly supplied public username or an existing marked dialog ID for an authorized group using the existing Telethon session. Numeric IDs are resolved only through the current session's accessible entity cache; no join or invite-link flow is attempted. It never logs in interactively, follows links, downloads media, sends messages, or stores message text. Default limit is 30 and the maximum is 100.
+
+```bash
+telegramlab inspect @ExampleChannel
+telegramlab inspect @ExampleChannel --limit 50 --json
+telegramlab inspect @ExampleChannel --save
+telegramlab inspect -1001234567890 --save  # already accessible dialog ID
+```
+
+The session defaults to the project-root `telegram_lab.session` file. Relative `TELEGRAMLAB_SESSION_PATH` values are resolved from the project root. If the session is missing or unauthorized, inspection stops without a login prompt. `--save` writes source metadata and an aggregate inspection summary to `data/sources.db`; it preserves existing manual metadata and notes, stores an available numeric Telegram ID, and leaves source status unchanged. Inspection summaries contain counts and dates only. The registry applies an additive versioned migration when saving the first inspection summary.
+
+Inspection counts messages containing URLs, Telegram references, external URLs, and VLESS or Shadowsocks URI candidates. Configuration URIs are never parsed or printed; URI values embedded in the returned public description are redacted. A Telegram flood wait is reported and ends the run without retrying.
 
 ## Security precautions
 

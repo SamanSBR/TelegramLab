@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import logging
 import re
 import sys
 from collections.abc import Sequence
 from dataclasses import asdict
+from datetime import UTC, datetime
 
 from telegramlab import __version__
 from telegramlab.core.config import Settings
@@ -25,6 +27,18 @@ from telegramlab.sources.registry import (
     update_source,
 )
 from telegramlab.storage.database import database_exists
+from telegramlab.telegram.client import (
+    MissingSessionError,
+    create_client,
+    require_existing_session,
+)
+from telegramlab.telegram.inspector import (
+    FloodWaitInspectionError,
+    InspectionError,
+    InvalidCredentialsError,
+    NetworkInspectionError,
+    inspect_source,
+)
 
 _SECRET_PATTERNS = (
     re.compile(r"(?i)(api[_-]?hash|api[_-]?id|token|password|secret)\s*([=:])\s*([^\s,;]+)"),
@@ -61,11 +75,27 @@ def _add_json_option(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON")
 
 
+def _inspection_limit(value: str) -> int:
+    try:
+        limit = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("limit must be an integer between 1 and 100") from None
+    if not 1 <= limit <= 100:
+        raise argparse.ArgumentTypeError("limit must be between 1 and 100")
+    return limit
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="telegramlab", description="Local-first Telegram research utility")
     parser.add_argument("--version", action="version", version=f"telegramlab {__version__}")
     commands = parser.add_subparsers(dest="command")
     commands.add_parser("status", help="Show offline application and local file status")
+
+    inspect = commands.add_parser("inspect", help="Read-only inspection of one accessible Telegram channel or group")
+    inspect.add_argument("target", help="Public username or an already accessible marked dialog ID")
+    inspect.add_argument("--limit", type=_inspection_limit, default=30, help="Recent messages to inspect (1–100, default 30)")
+    inspect.add_argument("--save", action="store_true", help="Save metadata and aggregate summary in the source registry")
+    inspect.add_argument("--json", action="store_true", help="Print structured JSON")
 
     source = commands.add_parser("source", help="Manage the local research source registry")
     actions = source.add_subparsers(dest="source_command", required=True)
@@ -191,6 +221,107 @@ def _run_source_command(args: argparse.Namespace, path) -> int:
     return 0
 
 
+async def _inspect_with_existing_session(target: str, limit: int, save: bool, registry_path, progress):
+    settings = Settings.from_env()
+    require_existing_session(settings.session_path)
+    if settings.api_id is None or not settings.api_hash:
+        raise InvalidCredentialsError("TG_API_ID and TG_API_HASH are required; no login prompt will be opened.")
+    try:
+        client = create_client(settings)
+    except MissingSessionError:
+        raise
+    except ValueError as error:
+        raise InvalidCredentialsError(str(error)) from None
+    connected = False
+    try:
+        await client.connect()
+        connected = True
+        if not await client.is_user_authorized():
+            raise InvalidCredentialsError("The existing Telegram session is not authorized; interactive login is disabled.")
+        return await inspect_source(
+            client, target, limit=limit, progress=progress,
+            registry_path=registry_path, save=save,
+        )
+    except Exception as error:
+        if isinstance(error, (InspectionError, MissingSessionError)):
+            raise
+        from telegramlab.telegram.inspector import _raise_mapped_error
+        _raise_mapped_error(error)
+        raise InspectionError(f"Telegram inspection failed ({type(error).__name__}).") from None
+    finally:
+        if connected:
+            try:
+                await client.disconnect()
+            except Exception:
+                # Cleanup failures should not replace a completed inspection result.
+                pass
+
+
+def _run_inspect(args: argparse.Namespace) -> int:
+    progress = (lambda message: print(message, file=sys.stderr)) if args.json else print
+    try:
+        result = asyncio.run(_inspect_with_existing_session(
+            args.target, args.limit, args.save,
+            Settings.from_env().sources_database_path, progress,
+        ))
+    except (InspectionError, MissingSessionError, InvalidCredentialsError, NetworkInspectionError) as error:
+        if args.json:
+            print(to_json({
+                "source_identity": {"provider": "telegram", "requested": args.target},
+                "metadata": {},
+                "inspected_at": datetime.now(UTC).isoformat(timespec="seconds"),
+                "limit": args.limit,
+                "findings": {},
+                "warnings": [str(error)],
+                "completion_status": "failed",
+            }))
+        else:
+            print(f"Error: {error}", file=sys.stderr)
+        return 1
+    except Exception as error:
+        # Expected credential parsing and OS-level setup errors stay concise.
+        message = "Invalid Telegram configuration." if isinstance(error, (ValueError, OSError)) else f"Inspection failed ({type(error).__name__})."
+        if args.json:
+            print(to_json({
+                "source_identity": {"provider": "telegram", "requested": args.target},
+                "metadata": {}, "inspected_at": datetime.now(UTC).isoformat(timespec="seconds"),
+                "limit": args.limit, "findings": {}, "warnings": [message], "completion_status": "failed",
+            }))
+        else:
+            print(f"Error: {message}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(to_json(result.as_dict()))
+    else:
+        print(f"Inspection complete: {result.metadata.get('title') or result.source_identity['username']}")
+        print(f"Inspected at: {result.inspected_at}")
+        print(f"Limit: {result.limit}")
+        print(f"Telegram ID: {result.metadata.get('telegram_id') or 'unknown'}")
+        print(f"Username: @{result.metadata['username']}" if result.metadata.get("username") else "Username: unknown")
+        print(f"Description: {result.metadata.get('description') or 'unknown'}")
+        print(f"Type: {result.metadata.get('source_type') or 'unknown'}")
+        print(f"Participant count: {result.metadata.get('participant_count') if result.metadata.get('participant_count') is not None else 'unknown'}")
+        print(f"Verified: {result.metadata.get('verified') if result.metadata.get('verified') is not None else 'unknown'}")
+        discussion = result.metadata.get("linked_discussion")
+        if discussion:
+            print("Linked discussion: " + (discussion.get("title") or discussion.get("username") or discussion["telegram_id"]))
+        else:
+            print("Linked discussion: unknown")
+        restrictions = result.metadata.get("access_restrictions")
+        print(f"Access restrictions: {restrictions if restrictions is not None else 'unknown'}")
+        print(f"Messages inspected: {result.findings['messages_inspected']} / {result.limit}")
+        for key, value in result.findings.items():
+            if key != "messages_inspected":
+                print(f"{key.replace('_', ' ').title()}: {value}")
+        if result.warnings:
+            print("Warnings:")
+            for warning in result.warnings:
+                print(f"- {warning}")
+        if result.registry_source_id is not None:
+            print(f"Registry source ID: {result.registry_source_id}")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     configure_logging()
     parser = build_parser()
@@ -200,9 +331,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"Application version: {__version__}")
         print(f"Database path: {settings.database_path}")
         print(f"Database exists: {'yes' if database_exists(settings.database_path) else 'no'}")
-        session_file = settings.session_path
-        if session_file.suffix != ".session":
-            session_file = session_file.with_suffix(".session")
+        from telegramlab.telegram.client import session_file_path
+        session_file = session_file_path(settings.session_path)
         print(f"Session file exists: {'yes' if session_file.is_file() else 'no'}")
         return 0
     if args.command == "source":
@@ -211,6 +341,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         except RegistryError as error:
             print(f"Error: {error}", file=sys.stderr)
             return 2
+    if args.command == "inspect":
+        return _run_inspect(args)
     parser.print_help()
     return 0
 
