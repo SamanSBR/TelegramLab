@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import logging
 import re
+import sqlite3
 import sys
 from collections.abc import Sequence
 from dataclasses import asdict
@@ -42,6 +43,8 @@ from telegramlab.telegram.inspector import (
 )
 from telegramlab.telegram.explorer import ExplorationResult, explore_source
 from telegramlab.telegram.search import SearchError, search_public, validate_search_query
+from telegramlab.telegram.content import ContentSearchError, search_content, validate as validate_content
+from telegramlab.research.workflow import ResearchError, run_research
 
 _SECRET_PATTERNS = (
     re.compile(r"(?i)(api[_-]?hash|api[_-]?id|token|password|secret)\s*([=:])\s*([^\s,;]+)"),
@@ -88,6 +91,16 @@ def _inspection_limit(value: str) -> int:
     return limit
 
 
+def _research_source_limit(value: str) -> int:
+    try:
+        limit = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("max-sources must be an integer between 1 and 10") from None
+    if not 1 <= limit <= 10:
+        raise argparse.ArgumentTypeError("max-sources must be between 1 and 10")
+    return limit
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="telegramlab", description="Local-first Telegram research utility")
     parser.add_argument("--version", action="version", version=f"telegramlab {__version__}")
@@ -119,6 +132,30 @@ def build_parser() -> argparse.ArgumentParser:
     discovery.add_argument("--json", action="store_true", help="Print structured JSON; progress goes to stderr")
     discovery.add_argument("--save", action="store_true", help="Save eligible public chats as inactive candidates with query provenance")
     discovery.add_argument("--verbose", action="store_true", help="Show discovery methods and warnings per result")
+
+    content = commands.add_parser("content", help="Search accessible public Telegram content")
+    content_actions = content.add_subparsers(dest="content_command", required=True)
+    content_search = content_actions.add_parser("search", help="Search public messages or the local content index")
+    content_search.add_argument("query")
+    content_search.add_argument("--source", help="Limit to one public broadcast channel username")
+    content_search.add_argument("--type", dest="content_type", choices=("message", "document", "photo", "video", "audio", "all"), default="all")
+    content_search.add_argument("--limit", type=_inspection_limit, default=20)
+    content_search.add_argument("--local", action="store_true", help="Search the saved index without Telegram access")
+    content_search.add_argument("--save", action="store_true", help="Index returned public content locally")
+    content_search.add_argument("--json", action="store_true")
+
+    research = commands.add_parser("research", help="Run a bounded source and evidence workflow")
+    research.add_argument("query", help="Literal source and optional content search query")
+    research.add_argument("--limit", type=_inspection_limit, default=20,
+                          help="Source result and per-source message limit (1–100)")
+    research.add_argument("--max-sources", type=_research_source_limit, default=3,
+                          help="Maximum discovered sources to inspect or explore (1–10, default 3)")
+    research.add_argument("--inspect", action="store_true")
+    research.add_argument("--explore", action="store_true")
+    research.add_argument("--content", action="store_true")
+    research.add_argument("--local", action="store_true", help="Review saved source and content evidence offline")
+    research.add_argument("--save", action="store_true", help="Persist evidence and workflow history")
+    research.add_argument("--json", action="store_true")
 
     source = commands.add_parser("source", help="Manage the local research source registry")
     actions = source.add_subparsers(dest="source_command", required=True)
@@ -505,6 +542,128 @@ def _run_search(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _content_with_existing_session(query, *, kind, source, limit, local, save, index_path, progress):
+    query, source = validate_content(query, kind, limit, source)
+    if local:
+        return await search_content(None, query, kind=kind, source=source, limit=limit,
+                                    local=True, index_path=index_path, progress=progress)
+    settings = Settings.from_env()
+    require_existing_session(settings.session_path)
+    if settings.api_id is None or not settings.api_hash:
+        raise InvalidCredentialsError("TG_API_ID and TG_API_HASH are required; no login prompt will be opened.")
+    client = create_client(settings)
+    connected = False
+    try:
+        await client.connect()
+        connected = True
+        if not await client.is_user_authorized():
+            raise InvalidCredentialsError("The existing Telegram session is not authorized; interactive login is disabled.")
+        return await search_content(client, query, kind=kind, source=source, limit=limit,
+                                    save=save, index_path=index_path, progress=progress)
+    finally:
+        if connected:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+
+
+def _run_content(args: argparse.Namespace) -> int:
+    progress = lambda message: print(message, file=sys.stderr)
+    try:
+        settings = Settings.from_env()
+        response = asyncio.run(_content_with_existing_session(
+            args.query, kind=args.content_type, source=args.source, limit=args.limit,
+            local=args.local, save=args.save, index_path=settings.content_database_path,
+            progress=progress))
+    except (InspectionError, MissingSessionError, ValueError, OSError) as error:
+        if args.json:
+            print(to_json({"query": args.query, "results": [], "warnings": [str(error)],
+                           "completion_status": "failed"}))
+        else:
+            print(f"Error: {error}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(to_json(response.as_dict()))
+    else:
+        print(f"Results: {len(response.results)}; returned messages: {response.scanned}; saved: {response.saved}")
+        for hit in response.results:
+            print(f"{hit.source_channel}/{hit.message_id} [{hit.content_type}; {hit.match_type}] "
+                  f"{hit.message_date or 'unknown date'} {hit.message_url or ''}")
+            if hit.filename:
+                print(f"  File: {hit.filename}")
+            if hit.text:
+                print(f"  {hit.text[:200].replace(chr(10), ' ')}")
+        for warning in response.warnings:
+            print(f"Warning: {warning}")
+    return 0
+
+
+async def _research_with_existing_session(args, settings, progress):
+    if args.local:
+        return await run_research(None, args.query, limit=args.limit, max_sources=args.max_sources,
+                                  inspect=args.inspect, explore=args.explore, content=args.content,
+                                  local=True, save=args.save, registry_path=settings.sources_database_path,
+                                  content_path=settings.content_database_path,
+                                  history_path=settings.research_database_path, progress=progress)
+    require_existing_session(settings.session_path)
+    if settings.api_id is None or not settings.api_hash:
+        raise InvalidCredentialsError("TG_API_ID and TG_API_HASH are required; no login prompt will be opened.")
+    client = create_client(settings)
+    connected = False
+    try:
+        await client.connect()
+        connected = True
+        if not await client.is_user_authorized():
+            raise InvalidCredentialsError("The existing Telegram session is not authorized; interactive login is disabled.")
+        return await run_research(client, args.query, limit=args.limit, max_sources=args.max_sources,
+                                  inspect=args.inspect, explore=args.explore, content=args.content,
+                                  local=False, save=args.save, registry_path=settings.sources_database_path,
+                                  content_path=settings.content_database_path,
+                                  history_path=settings.research_database_path, progress=progress)
+    finally:
+        if connected:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+
+
+def _run_research(args: argparse.Namespace) -> int:
+    try:
+        response = asyncio.run(_research_with_existing_session(
+            args, Settings.from_env(), lambda message: print(message, file=sys.stderr)))
+    except (InspectionError, MissingSessionError, RegistryError, sqlite3.DatabaseError, ValueError, OSError) as error:
+        if args.json:
+            print(to_json({"query": args.query, "sources": [], "content_results": [],
+                           "errors": [str(error)], "completion_status": "failed"}))
+        else:
+            print(f"Error: {error}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(to_json(response.as_dict()))
+    else:
+        print(f"Sources: {len(response.sources)}; inspected: {response.evidence_summary['sources_inspected']}; "
+              f"explored: {response.evidence_summary['sources_explored']}; "
+              f"content results: {response.evidence_summary['content_results']}")
+        for source in response.sources:
+            state = "inspected" if source.inspected else "discovered"
+            print(f"{source.entity_type}: {source.display_name or source.username} "
+                  f"(@{source.username}, ID {source.telegram_id or '-'}) [{state}]")
+            for error in source.errors:
+                print(f"  Warning: {error}")
+        for hit in response.content_results:
+            print(f"Content: {hit.source_channel}/{hit.message_id} [{hit.content_type}; {hit.match_type}] "
+                  f"{hit.message_url or ''}")
+        for warning in response.warnings:
+            print(f"Warning: {warning}")
+        for error in response.errors:
+            print(f"Error: {error}", file=sys.stderr)
+        if response.workflow_id is not None:
+            print(f"Workflow ID: {response.workflow_id}")
+    return 0 if response.completion_status == "completed" else 1
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     configure_logging()
     parser = build_parser()
@@ -530,6 +689,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_explore(args)
     if args.command == "search":
         return _run_search(args)
+    if args.command == "content":
+        return _run_content(args)
+    if args.command == "research":
+        return _run_research(args)
     parser.print_help()
     return 0
 

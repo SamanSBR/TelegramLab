@@ -1,6 +1,6 @@
 # TelegramLab
 
-TelegramLab is an independent, local-first foundation for ethical Telegram research. It supports offline source tracking, bounded public Telegram discovery, and read-only inspection. It does not automate messaging.
+TelegramLab is an independent, local-first foundation for ethical Telegram research. It supports offline source tracking, bounded public Telegram discovery, read-only inspection, and public content search. It does not automate messaging.
 
 ## Installation
 
@@ -93,6 +93,50 @@ telegramlab search "VLESS" --save
 The default mode is `telegram`, type is `all`, and limit is 20 (maximum 100). `--mode local` or `--local` searches the source registry only, without constructing a Telegram client. It matches display name, identifier, description, research category, and provider without case sensitivity. `--mode both` merges local and Telegram results by stable numeric ID when available, then normalized public username. Conflicting IDs or entity types are kept separate and warned about. A result records its origin, discovery method, timestamp, registry state, and available public metadata. Missing descriptions, counts, and verification remain unknown. Human progress stages go to stderr, leaving `--json` stdout machine readable.
 
 `--save` stores eligible public channels and groups as inactive `candidate` sources in `data/sources.db`; it never saves users. An additive migration creates `search_discoveries` to preserve the original query and discovery time per source. Repeated searches do not duplicate sources or provenance rows. Existing names, notes, category, status, and research metadata remain intact. Username conflicts stop saving that result. Search does not join chats, enumerate members, fetch URLs, inspect private conversations, or send messages. It uses the existing authorized session and does not prompt for credentials. Missing sessions, authorization errors, timeouts, and Telegram flood waits are reported; flood waits are not retried. Telegram result coverage depends on its public index, account access, and server limits.
+
+### Public content search
+
+`content search` searches Telegram's accessible public broadcast channel messages with one bounded search request. Global search uses Telegram's ranked `messages.SearchGlobalRequest`; `--source` resolves one public channel and uses `messages.SearchRequest`. Search coverage is incomplete and depends on Telegram indexing, account access, and the server limit. Private channels, groups, user dialogs, and results without a public channel username are omitted. The command does not join chats, enumerate members, fetch links, download media, or send messages.
+
+```bash
+telegramlab content search "VLESS"
+telegramlab content search "سامان صابری" --json
+telegramlab content search "proxy" --source @ExampleChannel
+telegramlab content search "Python" --type document --limit 20
+telegramlab content search "landscape" --type photo
+telegramlab content search "interview" --type video
+telegramlab content search "music" --type audio
+telegramlab content search "VPN" --save
+telegramlab content search "VPN" --local
+```
+
+`--type` accepts `message`, `document`, `photo`, `video`, `audio`, or `all` (default). `--limit` defaults to 20 and is capped at 100. Telegram's document, photo, and video filters narrow server results; audio includes music and voice notes by filtering the bounded returned page locally. A server result may contain a text, filename, or metadata match. Results label these as `exact_text`, `partial_text`, `filename`, or `metadata`. An exact text match means the normalized query appears with word boundaries; it does not mean Telegram verified an identity. Real names are treated as mentions only.
+
+Each result includes the public source username and numeric Telegram ID, message ID and date, available public `t.me` URL, original query, discovery timestamp, content type, match type, original text, filename, and MIME type when available. Persian and Arabic letter variants, presentation forms, diacritics, and zero width joiners are normalized for local matching; stored text remains unchanged. `--json` emits structured results to stdout and progress to stderr.
+
+`--save` writes returned public results to a separate SQLite index at `data/content.db` (override with `TELEGRAMLAB_CONTENT_DB_PATH`). The first write adds versioned tables for content and per-query discovery evidence; repeated source ID and message ID pairs do not duplicate content. `--local` searches only this index, opens it read-only, and requires no session or network. `--local --save` does not write. Existing `telegram_lab.db`, `data/sources.db`, and `telegram_lab.session` are neither migrated nor used as the content index. Missing or unauthorized sessions, inaccessible sources, timeouts, and flood waits produce errors; flood waits are not retried.
+
+### Unified research workflow
+
+`research` composes public source discovery with optional inspection, reference exploration, and content search. The default runs one bounded source search and displays the returned public channels and groups. It does not inspect, explore, search messages, or persist data unless requested. The existing authorized session is reused for all live stages; no login prompt is opened.
+
+```bash
+telegramlab research "کانفیگ رایگان"
+telegramlab research "VLESS" --limit 10
+telegramlab research "sing-box" --inspect
+telegramlab research "proxy" --inspect --explore --max-sources 2
+telegramlab research "Python" --content
+telegramlab research "سامان صابری" --content
+telegramlab research "VLESS" --json
+telegramlab research "VLESS" --save
+telegramlab research "VLESS" --local
+```
+
+`--limit` bounds source results, messages read per inspected or explored source, and content search results (default 20, maximum 100). `--max-sources` limits the number of discovered sources passed to inspection or exploration (default 3, maximum 10). These stages run sequentially and only on returned public source results with stable Telegram IDs. Each source is checked against that ID when its username is resolved; a changed username identity is skipped. One source failure is reported with partial results; FloodWait stops all remaining Telegram stages without retrying. Cancellation propagates and stops the workflow.
+
+Results distinguish discovery from completed inspection. They include discovery method and timestamp, stable ID, inspection timestamp and observed message counts, VLESS and Shadowsocks candidate counts, reference counts and per-message provenance, and content evidence with message URLs. These are observations, not tested or working configurations. Real names in messages remain mentions, not verified identities. An empty search result does not prove absence. `--content` uses Telegram's bounded global public message search and has incomplete coverage.
+
+`--save` opts into the existing source registry persistence for discovered sources, inspection summaries, and reference evidence; content results go to the separate content index. It also creates `data/research.db` for versioned workflow execution history (override with `TELEGRAMLAB_RESEARCH_DB_PATH`). Existing source notes, names, and statuses are preserved. `--local` reviews matching saved source metadata, saved source-query provenance, and indexed content without network access or database creation. `--local --save` records a workflow history entry but does not alter source or content evidence. Research refuses to recreate a missing source registry. There is no automatic channel joining, private chat discovery, member enumeration, file download, external URL fetch, messaging, recursive crawl, or background scheduling.
 
 ## Security precautions
 

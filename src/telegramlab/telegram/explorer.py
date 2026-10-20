@@ -55,6 +55,7 @@ async def explore_source(
     progress: Callable[[str], None] | None = print,
     registry_path: Any | None = None,
     save: bool = False,
+    expected_id: str | None = None,
 ) -> ExplorationResult:
     """Explore one explicitly selected accessible channel/group, without following links."""
     if not 1 <= limit <= _MAX_LIMIT:
@@ -72,6 +73,8 @@ async def explore_source(
         raise InspectionError(f"Could not resolve Telegram source ({type(error).__name__}).") from None
     source_type = _channel_type(entity)
     source_id = str(getattr(entity, "id", ""))
+    if expected_id is not None and source_id != str(expected_id):
+        raise InspectionError("Resolved source ID differs from the discovered source; exploration skipped.")
     if not source_id.isdigit():
         raise InspectionError("Telegram did not provide a numeric source ID.")
     username = getattr(entity, "username", None)

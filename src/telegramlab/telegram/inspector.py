@@ -214,6 +214,7 @@ async def inspect_source(
     progress: Callable[[str], None] | None = print,
     registry_path: Any | None = None,
     save: bool = False,
+    expected_id: str | None = None,
 ) -> InspectionResult:
     """Inspect one supplied username or cached dialog ID without joining or persisting text."""
     limit = validate_limit(limit)
@@ -230,6 +231,8 @@ async def inspect_source(
         raise InspectionError(f"Could not resolve Telegram source ({type(error).__name__}).") from None
 
     source_type = _channel_type(entity)
+    if expected_id is not None and str(getattr(entity, "id", "")) != str(expected_id):
+        raise InvalidSourceError("Resolved source ID differs from the discovered source; inspection skipped.")
     report("[2/4] Fetching available metadata")
     metadata, warnings = await _metadata(client, entity, source_type)
 

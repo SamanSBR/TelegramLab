@@ -23,6 +23,8 @@ class Settings:
     session_path: Path
     api_id: int | None = None
     api_hash: str | None = None
+    content_database_path: Path = PROJECT_ROOT / "data" / "content.db"
+    research_database_path: Path = PROJECT_ROOT / "data" / "research.db"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -35,6 +37,12 @@ class Settings:
                 os.environ.get("TELEGRAMLAB_SOURCES_DB_PATH"), PROJECT_ROOT / "data" / "sources.db"
             ),
             session_path=_project_path(os.environ.get("TELEGRAMLAB_SESSION_PATH"), PROJECT_ROOT / "telegram_lab"),
+            content_database_path=_project_path(
+                os.environ.get("TELEGRAMLAB_CONTENT_DB_PATH"), PROJECT_ROOT / "data" / "content.db"
+            ),
+            research_database_path=_project_path(
+                os.environ.get("TELEGRAMLAB_RESEARCH_DB_PATH"), PROJECT_ROOT / "data" / "research.db"
+            ),
             api_id=int(raw_api_id) if raw_api_id else None,
             api_hash=raw_api_hash or None,
         )
