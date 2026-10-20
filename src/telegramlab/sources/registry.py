@@ -315,6 +315,78 @@ def search_sources(path: Path, query: str) -> list[Source]:
         db.close()
 
 
+def save_search_candidates(path: Path, results: list[object]) -> dict[str, object]:
+    """Additively record public chat candidates and literal search provenance."""
+    if not results:
+        return {"created": 0, "ids": {}}
+    initialize_database(path)
+    db = sqlite3.connect(path)
+    db.row_factory = sqlite3.Row
+    db.execute("PRAGMA foreign_keys = ON")
+    created = 0
+    ids: dict[tuple[str, str], int] = {}
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        db.execute("""CREATE TABLE IF NOT EXISTS schema_migrations (
+            version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)""")
+        db.execute("""CREATE TABLE IF NOT EXISTS search_discoveries (
+            id INTEGER PRIMARY KEY,
+            source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+            search_query TEXT NOT NULL,
+            discovery_method TEXT NOT NULL,
+            discovered_at TEXT NOT NULL,
+            UNIQUE(source_id, search_query, discovery_method)
+        )""")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_search_discoveries_source ON search_discoveries(source_id)")
+        db.execute("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (3, ?)", (_now(),))
+        for result in results:
+            kind = str(getattr(result, "entity_type"))
+            username = str(getattr(result, "username") or "").casefold()
+            if kind not in {"channel", "group"} or not re.fullmatch(r"[a-z0-9_]{5,32}", username):
+                continue
+            numeric = str(getattr(result, "telegram_id") or "")
+            identifier, url, key = normalize_telegram_identifier("@" + username)
+            by_name = db.execute("SELECT * FROM sources WHERE provider='telegram' AND identity_key=?",
+                                 (key,)).fetchall()
+            if any(row["platform_id"] and numeric and row["platform_id"] != numeric for row in by_name):
+                raise RegistryError("Identity conflict: a search username belongs to a different Telegram ID.")
+            if any(row["source_type"] != kind for row in by_name):
+                raise RegistryError("Identity conflict: a search username has a different registered entity type.")
+            by_id = db.execute("SELECT * FROM sources WHERE provider='telegram' AND platform_id=?",
+                               (numeric,)).fetchall() if numeric else []
+            if any(row["source_type"] != kind for row in by_id):
+                raise RegistryError("Identity conflict: a Telegram ID has a different registered entity type.")
+            matches = [row for row in by_id + by_name if row["source_type"] == kind]
+            if matches:
+                source_id = int(matches[0]["id"])
+            else:
+                timestamp = str(getattr(result, "discovered_at"))
+                now = _now()
+                cursor = db.execute("""INSERT INTO sources
+                    (provider, source_type, identifier, identity_key, canonical_url, display_name,
+                     description, discovery_method, discovered_from, discovered_at, status,
+                     research_category, notes, created_at, updated_at, platform_id)
+                    VALUES ('telegram', ?, ?, ?, ?, ?, ?, 'telegram_public_search', ?, ?,
+                            'candidate', 'general', NULL, ?, ?, ?)""",
+                    (kind, identifier, key, url, getattr(result, "display_name"),
+                     getattr(result, "description"), str(getattr(result, "search_query")),
+                     timestamp, now, now, numeric or None))
+                source_id = int(cursor.lastrowid)
+                created += 1
+            db.execute("""INSERT OR IGNORE INTO search_discoveries
+                (source_id, search_query, discovery_method, discovered_at) VALUES (?, ?, ?, ?)""",
+                (source_id, str(getattr(result, "search_query")),
+                 str(getattr(result, "discovery_method")), str(getattr(result, "discovered_at"))))
+            ids[(kind, username)] = source_id
+        db.commit()
+        return {"created": created, "ids": ids}
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
 def update_source(path: Path, source_id: int, **changes: str | None) -> Source:
     allowed = {"canonical_url", "display_name", "description", "discovery_method",
                "discovered_from", "last_checked_at", "status", "research_category", "notes", "platform_id"}

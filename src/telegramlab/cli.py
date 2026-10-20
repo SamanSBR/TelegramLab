@@ -41,6 +41,7 @@ from telegramlab.telegram.inspector import (
     normalize_target,
 )
 from telegramlab.telegram.explorer import ExplorationResult, explore_source
+from telegramlab.telegram.search import SearchError, search_public, validate_search_query
 
 _SECRET_PATTERNS = (
     re.compile(r"(?i)(api[_-]?hash|api[_-]?id|token|password|secret)\s*([=:])\s*([^\s,;]+)"),
@@ -105,6 +106,19 @@ def build_parser() -> argparse.ArgumentParser:
                          help="Recent messages to inspect (1–100, default 30)")
     explore.add_argument("--save", action="store_true", help="Save candidates and reference provenance")
     explore.add_argument("--json", action="store_true", help="Print structured JSON")
+
+    discovery = commands.add_parser("search", help="Discover public Telegram chats or search the local registry")
+    discovery.add_argument("query", help="Exact @username or literal name, partial name, or keyword query")
+    discovery.add_argument("--mode", choices=("telegram", "local", "both"), default="telegram",
+                           help="Search Telegram, the local registry, or both (default: telegram)")
+    discovery.add_argument("--local", action="store_true", help="Alias for --mode local; makes no Telegram request")
+    discovery.add_argument("--type", dest="entity_type", choices=("channel", "group", "all"), default="all",
+                           help="Filter channel or group results (default: all)")
+    discovery.add_argument("--limit", type=_inspection_limit, default=20,
+                           help="Maximum results and Telegram request limit (1–100, default 20)")
+    discovery.add_argument("--json", action="store_true", help="Print structured JSON; progress goes to stderr")
+    discovery.add_argument("--save", action="store_true", help="Save eligible public chats as inactive candidates with query provenance")
+    discovery.add_argument("--verbose", action="store_true", help="Show discovery methods and warnings per result")
 
     source = commands.add_parser("source", help="Manage the local research source registry")
     actions = source.add_subparsers(dest="source_command", required=True)
@@ -425,6 +439,72 @@ def _run_explore(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _search_with_existing_session(query, *, mode, entity_type, limit, registry_path, save, progress):
+    query = validate_search_query(query, mode, entity_type, limit)
+    if mode == "local":
+        return await search_public(None, query, mode=mode, entity_type=entity_type,
+                                   limit=limit, registry_path=registry_path, save=save, progress=progress)
+    settings = Settings.from_env()
+    require_existing_session(settings.session_path)
+    if settings.api_id is None or not settings.api_hash:
+        raise InvalidCredentialsError("TG_API_ID and TG_API_HASH are required; no login prompt will be opened.")
+    client = create_client(settings)
+    connected = False
+    try:
+        await client.connect()
+        connected = True
+        if not await client.is_user_authorized():
+            raise InvalidCredentialsError("The existing Telegram session is not authorized; interactive login is disabled.")
+        return await search_public(client, query, mode=mode, entity_type=entity_type,
+                                   limit=limit, registry_path=registry_path, save=save, progress=progress)
+    except Exception as error:
+        if isinstance(error, (InspectionError, MissingSessionError, RegistryError)):
+            raise
+        from telegramlab.telegram.inspector import _raise_mapped_error
+        _raise_mapped_error(error)
+        raise SearchError(f"Telegram search failed ({type(error).__name__}).") from None
+    finally:
+        if connected:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+
+
+def _run_search(args: argparse.Namespace) -> int:
+    mode = "local" if args.local else args.mode
+    progress = lambda message: print(message, file=sys.stderr)
+    try:
+        response = asyncio.run(_search_with_existing_session(
+            args.query, mode=mode, entity_type=args.entity_type, limit=args.limit,
+            registry_path=Settings.from_env().sources_database_path,
+            save=args.save, progress=progress))
+    except (InspectionError, MissingSessionError, RegistryError, ValueError, OSError) as error:
+        if args.json:
+            print(to_json({"query": args.query, "mode": mode, "results": [],
+                           "warnings": [str(error)], "completion_status": "failed"}))
+        else:
+            print(f"Error: {error}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(to_json(response.as_dict()))
+    else:
+        print(f"Telegram results: {response.telegram_returned}; local matches: {response.local_found}; "
+              f"saved candidates: {response.candidates_saved}")
+        for item in response.results:
+            marker = "registered" if item.already_registered else "new"
+            name = item.display_name or item.username or item.telegram_id or "unknown"
+            print(f"{item.entity_type}: {name} (@{item.username or '-'}, ID {item.telegram_id or '-'}) "
+                  f"[{item.origin}; {marker}]")
+            if args.verbose:
+                print(f"  method: {item.discovery_method}; discovered: {item.discovered_at}")
+            for warning in item.warnings:
+                print(f"  warning: {warning}")
+        for warning in response.warnings:
+            print(f"Warning: {warning}")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     configure_logging()
     parser = build_parser()
@@ -448,6 +528,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_inspect(args)
     if args.command == "explore":
         return _run_explore(args)
+    if args.command == "search":
+        return _run_search(args)
     parser.print_help()
     return 0
 

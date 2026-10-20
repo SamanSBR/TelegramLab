@@ -1,6 +1,6 @@
 # TelegramLab
 
-TelegramLab is an independent, local-first foundation for ethical Telegram research. This phase establishes package structure, offline status reporting, configuration, and safety boundaries. It does not automate Telegram collection or messaging.
+TelegramLab is an independent, local-first foundation for ethical Telegram research. It supports offline source tracking, bounded public Telegram discovery, and read-only inspection. It does not automate messaging.
 
 ## Installation
 
@@ -12,7 +12,7 @@ python -m venv .venv
 python -m pip install -e '.[dev]'
 ```
 
-Telegram authentication continues to use the existing `telegram_lab.session` basename in the project directory by default. Telegram credentials are optional for offline commands and are read from `TG_API_ID` and `TG_API_HASH` only for inspection. Local paths can be set with `TELEGRAMLAB_DB_PATH`, `TELEGRAMLAB_SOURCES_DB_PATH`, and `TELEGRAMLAB_SESSION_PATH`; relative paths resolve from the project directory.
+Telegram authentication continues to use the existing `telegram_lab.session` basename in the project directory by default. Telegram credentials are optional for offline commands and are read from `TG_API_ID` and `TG_API_HASH` for Telegram operations. Local paths can be set with `TELEGRAMLAB_DB_PATH`, `TELEGRAMLAB_SOURCES_DB_PATH`, and `TELEGRAMLAB_SESSION_PATH`; relative paths resolve from the project directory.
 
 ## Architecture
 
@@ -74,6 +74,25 @@ telegramlab explore @ExampleChannel --save
 It reports unique references and occurrence counts for user mentions, channel references, message permalinks, external websites, GitHub and GitLab repositories, subscription URL candidates, and unknown references. A `t.me/<username>` link alone remains an unknown reference because a username may identify a user or a channel. Private invite links are omitted. Each finding retains its originating Telegram source ID, message ID, discovery time, type, and normalized target. JSON output includes the per-message provenance.
 
 The explorer never follows discovered URLs, joins sources, sends messages, downloads media, or stores message text. `--save` writes candidates and per-message evidence to `data/sources.db` using an additive schema migration. Candidates remain unverified and inactive; ambiguous Telegram reference types use separate registry identities. Existing source notes and metadata are preserved. Telegram flood waits stop the run without automatic retries.
+
+### Telegram search and discovery
+
+`search` accepts one literal query. An `@username` or public `t.me/username` link uses exact entity resolution; other text uses one bounded Telegram `contacts.SearchRequest` against the public chat index. Text can be a name, partial name, keyword, or multi-word phrase. Telegram determines matching and ranking; results are incomplete and there is no wildcard expansion. Exact resolution can return a user; user profiles are identified as such and never saved as candidates. No messages are searched.
+
+```bash
+telegramlab search "VLESS"
+telegramlab search "VPN Iran" --mode both
+telegramlab search "proxy" --type channel --limit 10
+telegramlab search "internet" --type group
+telegramlab search @zenmaxai --json
+telegramlab search "config" --local
+telegramlab search "Shadowsocks" --mode both --verbose
+telegramlab search "VLESS" --save
+```
+
+The default mode is `telegram`, type is `all`, and limit is 20 (maximum 100). `--mode local` or `--local` searches the source registry only, without constructing a Telegram client. It matches display name, identifier, description, research category, and provider without case sensitivity. `--mode both` merges local and Telegram results by stable numeric ID when available, then normalized public username. Conflicting IDs or entity types are kept separate and warned about. A result records its origin, discovery method, timestamp, registry state, and available public metadata. Missing descriptions, counts, and verification remain unknown. Human progress stages go to stderr, leaving `--json` stdout machine readable.
+
+`--save` stores eligible public channels and groups as inactive `candidate` sources in `data/sources.db`; it never saves users. An additive migration creates `search_discoveries` to preserve the original query and discovery time per source. Repeated searches do not duplicate sources or provenance rows. Existing names, notes, category, status, and research metadata remain intact. Username conflicts stop saving that result. Search does not join chats, enumerate members, fetch URLs, inspect private conversations, or send messages. It uses the existing authorized session and does not prompt for credentials. Missing sessions, authorization errors, timeouts, and Telegram flood waits are reported; flood waits are not retried. Telegram result coverage depends on its public index, account access, and server limits.
 
 ## Security precautions
 
