@@ -40,3 +40,23 @@ def test_status_reports_missing_files(tmp_path, monkeypatch, capsys):
     output = capsys.readouterr().out
     assert "Database exists: no" in output
     assert "Session file exists: no" in output
+
+
+def test_source_cli_add_list_and_error_are_offline(tmp_path, monkeypatch, capsys):
+    import socket
+
+    from telegramlab.cli import main as cli_main
+
+    def no_network(*args, **kwargs):
+        raise AssertionError("source commands must not access the network")
+
+    monkeypatch.setattr(socket, "create_connection", no_network)
+    monkeypatch.setenv("TELEGRAMLAB_SOURCES_DB_PATH", str(tmp_path / "data" / "sources.db"))
+    assert cli_main(["source", "add", "--provider", "telegram", "--type", "channel",
+                     "--identifier", "@ExampleChannel", "--json"]) == 0
+    assert '"status": "candidate"' in capsys.readouterr().out
+    assert cli_main(["source", "list"]) == 0
+    assert "@examplechannel" in capsys.readouterr().out
+    assert cli_main(["source", "add", "--provider", "telegram", "--type", "channel",
+                     "--identifier", "@x"]) == 2
+    assert "Error:" in capsys.readouterr().err
