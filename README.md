@@ -16,7 +16,7 @@ Telegram authentication continues to use the existing `telegram_lab.session` bas
 
 ## Architecture
 
-`src/telegramlab/` separates core settings and models, Telethon client setup, storage, collectors, source registry, link extractors, research workflows, campaigns, and exports. The extension modules are placeholders; they do not collect or process Telegram content yet. Existing top-level learning and collection scripts remain available.
+`src/telegramlab/` separates core settings and models, Telethon client setup, storage, collectors, source registry, link extractors, research workflows, campaigns, and exports. The reference explorer reuses the existing Telethon client, URL entity extraction, and source registry. Existing top-level learning and collection scripts remain available.
 
 ## CLI
 
@@ -60,6 +60,21 @@ The session defaults to the project-root `telegram_lab.session` file. Relative `
 
 Inspection counts messages containing URLs, Telegram references, external URLs, and VLESS or Shadowsocks URI candidates. Configuration URIs are never parsed or printed; URI values embedded in the returned public description are redacted. A Telegram flood wait is reported and ends the run without retrying.
 
+### Telegram reference exploration
+
+The explorer reads up to 100 recent accessible messages from one explicitly selected source, with a default limit of 30. It uses the existing authenticated session and does not prompt for login.
+
+```bash
+telegramlab explore @ExampleChannel
+telegramlab explore @ExampleChannel --limit 100
+telegramlab explore @ExampleChannel --json
+telegramlab explore @ExampleChannel --save
+```
+
+It reports unique references and occurrence counts for user mentions, channel references, message permalinks, external websites, GitHub and GitLab repositories, subscription URL candidates, and unknown references. A `t.me/<username>` link alone remains an unknown reference because a username may identify a user or a channel. Private invite links are omitted. Each finding retains its originating Telegram source ID, message ID, discovery time, type, and normalized target. JSON output includes the per-message provenance.
+
+The explorer never follows discovered URLs, joins sources, sends messages, downloads media, or stores message text. `--save` writes candidates and per-message evidence to `data/sources.db` using an additive schema migration. Candidates remain unverified and inactive; ambiguous Telegram reference types use separate registry identities. Existing source notes and metadata are preserved. Telegram flood waits stop the run without automatic retries.
+
 ## Security precautions
 
 Keep API credentials in environment variables or a secrets manager. Do not commit credentials, Telethon session files, local databases, or exports. A Telethon session can authenticate to the account; protect its filesystem permissions. Treat collected messages as private research data. Request only sources the account is authorized to access, respect Telegram rate limits and flood waits, and avoid unsolicited messaging or profiling. Logging uses key-value formatting and redacts common credential-shaped values; do not log message text or session contents.
@@ -67,8 +82,8 @@ Keep API credentials in environment variables or a secrets manager. Do not commi
 ## Development roadmap
 
 1. Foundation: modular package, offline CLI, configuration, and safety defaults.
-2. Add tested, explicit source discovery and incremental collection with per-source checkpoints, bounded retries, and Telegram limit handling.
-3. Add link extraction and source relationship analysis over authorized data.
+2. Add explicit incremental synchronization with per-source checkpoints, bounded retries, and Telegram limit handling.
+3. Add source relationship review and analysis over authorized data, with evidence and source permission checks.
 4. Add opt-in reporting and export formats, followed by carefully scoped integrations with SourceSeer and ShowTor.
 
 Each stage should preserve the local session and database, add migration tests before schema changes, and make source scope and data handling explicit. Public research features and customer acquisition intelligence require separate review of source permissions, privacy, and applicable platform rules before implementation.

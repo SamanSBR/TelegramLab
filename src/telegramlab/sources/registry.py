@@ -123,6 +123,9 @@ def normalize_telegram_identifier(identifier: str) -> tuple[str, str | None, str
 
 def _normalize_identity(provider: str, identifier: str) -> tuple[str, str | None, str]:
     if provider == "telegram":
+        if identifier.casefold().startswith("tg://"):
+            normalized = identifier.strip()
+            return normalized, None, normalized
         if identifier.startswith("telegram-id:"):
             numeric_id = identifier.removeprefix("telegram-id:")
             if not re.fullmatch(r"-?\d{1,20}", numeric_id):
@@ -521,6 +524,165 @@ def save_inspection_record(
     except sqlite3.IntegrityError as error:
         db.rollback()
         raise RegistryError(f"Inspection summary could not be saved: {error}.") from None
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def save_reference_discoveries(
+    path: Path,
+    *,
+    origin_source_id: str,
+    origin_identifier: str,
+    origin_source_type: str,
+    origin_title: str | None,
+    discoveries: list[dict[str, object]],
+) -> dict[str, int]:
+    """Persist candidate source records and per-message reference provenance.
+
+    All writes, including additive schema migrations, share one transaction.
+    Reference candidates remain candidates and source metadata is never replaced.
+    """
+    provider = "telegram"
+    origin_source_type = _slug(origin_source_type, "source type")
+    origin_identifier = origin_identifier.strip()
+    normalized_origin, origin_url, origin_key = _normalize_identity(provider, origin_identifier)
+    origin_numeric_id = str(origin_source_id).strip()
+    if not origin_numeric_id.isdigit():
+        raise RegistryError("Origin Telegram source ID must be numeric.")
+
+    initialize_database(path)
+    db = sqlite3.connect(path)
+    db.row_factory = sqlite3.Row
+    db.execute("PRAGMA foreign_keys = ON")
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        # Migration 1: Task 4 inspection summaries. Migration 2: reference provenance.
+        db.execute("""CREATE TABLE IF NOT EXISTS schema_migrations (
+            version INTEGER PRIMARY KEY,
+            applied_at TEXT NOT NULL
+        )""")
+        applied = {row[0] for row in db.execute("SELECT version FROM schema_migrations")}
+        if 1 not in applied:
+            db.execute("""CREATE TABLE IF NOT EXISTS inspection_runs (
+                id INTEGER PRIMARY KEY,
+                source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                inspected_at TEXT NOT NULL,
+                message_limit INTEGER NOT NULL,
+                messages_inspected INTEGER NOT NULL,
+                messages_containing_urls INTEGER NOT NULL,
+                messages_containing_telegram_references INTEGER NOT NULL,
+                messages_containing_external_urls INTEGER NOT NULL,
+                messages_containing_vless_candidates INTEGER NOT NULL,
+                messages_containing_shadowsocks_candidates INTEGER NOT NULL,
+                earliest_message_date TEXT,
+                latest_message_date TEXT,
+                warnings_json TEXT NOT NULL,
+                completion_status TEXT NOT NULL
+            )""")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_inspection_runs_source_time "
+                       "ON inspection_runs(source_id, inspected_at)")
+            db.execute("INSERT INTO schema_migrations(version, applied_at) VALUES (1, ?)", (_now(),))
+        if 2 not in applied:
+            db.execute("""CREATE TABLE IF NOT EXISTS source_references (
+                id INTEGER PRIMARY KEY,
+                origin_source_id TEXT NOT NULL,
+                origin_source_registry_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                origin_message_id INTEGER NOT NULL,
+                discovered_at TEXT NOT NULL,
+                reference_type TEXT NOT NULL,
+                normalized_target TEXT NOT NULL,
+                occurrence_count INTEGER NOT NULL CHECK (occurrence_count > 0),
+                candidate_source_id INTEGER REFERENCES sources(id) ON DELETE SET NULL,
+                evidence_reference TEXT NOT NULL,
+                UNIQUE (origin_source_id, origin_message_id, reference_type, normalized_target)
+            )""")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_source_references_target "
+                       "ON source_references(reference_type, normalized_target)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_source_references_origin "
+                       "ON source_references(origin_source_id, origin_message_id)")
+            db.execute("INSERT INTO schema_migrations(version, applied_at) VALUES (2, ?)", (_now(),))
+
+        origin_matches = db.execute(
+            "SELECT id, source_type, platform_id FROM sources WHERE provider=? AND identity_key=?",
+            (provider, origin_key),
+        ).fetchall()
+        if any(row["platform_id"] and row["platform_id"] != origin_numeric_id for row in origin_matches):
+            raise RegistryError("Origin identity conflict: this Telegram username has a different numeric ID.")
+        origin_row = next((row for row in origin_matches if row["source_type"] == origin_source_type), None)
+        if origin_row is None:
+            now = _now()
+            cursor = db.execute("""INSERT INTO sources
+                (provider, source_type, identifier, identity_key, canonical_url, display_name,
+                 description, discovery_method, discovered_from, discovered_at, last_checked_at,
+                 status, research_category, notes, created_at, updated_at, platform_id)
+                VALUES (?, ?, ?, ?, ?, ?, NULL, 'manually_added', NULL, ?, NULL,
+                        'candidate', 'general', NULL, ?, ?, ?)""",
+                (provider, origin_source_type, normalized_origin, origin_key, origin_url,
+                 origin_title, _now(), now, now, origin_numeric_id))
+            origin_registry_id = int(cursor.lastrowid)
+        else:
+            origin_registry_id = int(origin_row["id"])
+            db.execute("""UPDATE sources SET
+                canonical_url=COALESCE(NULLIF(canonical_url,''), ?),
+                display_name=COALESCE(NULLIF(display_name,''), ?),
+                platform_id=COALESCE(NULLIF(platform_id,''), ?), updated_at=?
+                WHERE id=?""",
+                (origin_url, origin_title, origin_numeric_id, _now(), origin_registry_id))
+
+        candidate_created = 0
+        for discovery in discoveries:
+            ref_type = _slug(str(discovery["reference_type"]), "reference type")
+            candidate_provider = _slug(str(discovery["candidate_provider"]), "provider")
+            candidate_type = _slug(str(discovery["candidate_source_type"]), "source type")
+            candidate_identifier = str(discovery["candidate_identifier"])
+            normalized, canonical_url, identity = _normalize_identity(candidate_provider, candidate_identifier)
+            message_id = int(discovery["origin_message_id"])
+            timestamp = str(discovery["discovered_at"])
+            target = str(discovery["normalized_target"])
+            occurrences = int(discovery["occurrence_count"])
+            if message_id <= 0 or occurrences <= 0:
+                raise RegistryError("Reference message IDs and occurrence counts must be positive.")
+            first_seen = f"telegram:{origin_numeric_id}/{message_id}"
+            now = _now()
+            cursor = db.execute("""INSERT OR IGNORE INTO sources
+                (provider, source_type, identifier, identity_key, canonical_url, display_name,
+                 description, discovery_method, discovered_from, discovered_at, last_checked_at,
+                 status, research_category, notes, created_at, updated_at, platform_id)
+                VALUES (?, ?, ?, ?, ?, NULL, NULL, 'referenced_by_message', ?, ?, NULL,
+                        'candidate', 'general', NULL, ?, ?, NULL)""",
+                (candidate_provider, candidate_type, normalized, identity, canonical_url,
+                 first_seen, timestamp, now, now))
+            candidate_created += max(cursor.rowcount, 0)
+            candidate_row = db.execute("""SELECT id FROM sources
+                WHERE provider=? AND source_type=? AND identity_key=?""",
+                (candidate_provider, candidate_type, identity)).fetchone()
+            if candidate_row is None:
+                raise RegistryError("Could not create or resolve a reference candidate.")
+            candidate_id = int(candidate_row["id"])
+            evidence = f"telegram:{origin_numeric_id}/{message_id}"
+            db.execute("""INSERT INTO source_references
+                (origin_source_id, origin_source_registry_id, origin_message_id, discovered_at,
+                 reference_type, normalized_target, occurrence_count, candidate_source_id,
+                 evidence_reference)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(origin_source_id, origin_message_id, reference_type, normalized_target)
+                DO UPDATE SET occurrence_count=excluded.occurrence_count,
+                              candidate_source_id=COALESCE(source_references.candidate_source_id,
+                                                           excluded.candidate_source_id)""",
+                (origin_numeric_id, origin_registry_id, message_id, timestamp, ref_type,
+                 target, occurrences, candidate_id, evidence))
+        db.commit()
+        return {
+            "origin_source_registry_id": origin_registry_id,
+            "candidate_sources_created": candidate_created,
+            "provenance_records_saved": len(discoveries),
+        }
+    except sqlite3.IntegrityError as error:
+        db.rollback()
+        raise RegistryError(f"Reference records could not be saved: {error}.") from None
     except Exception:
         db.rollback()
         raise

@@ -34,12 +34,30 @@ def _utf16_slice(text: str, offset: int, length: int) -> str:
 
 def extract_urls(text: str | None, entities: list[object] | None = None) -> list[str]:
     """Extract and deduplicate URLs, including Telegram's UTF-16 entities."""
-    text = text or ""
     found: dict[str, str] = {}
-    for match in _URL_RE.finditer(text):
-        url = _clean_url(match.group(0))
+    for url, _start, _end in extract_url_occurrences(text, entities):
         if url:
             found.setdefault(_url_key(url), url)
+    return list(found.values())
+
+
+def extract_url_occurrences(
+    text: str | None,
+    entities: list[object] | None = None,
+) -> list[tuple[str, int, int]]:
+    """Return URL targets and UTF-16 text spans, deduplicating entity overlap.
+
+    Repeated links at different offsets remain separate occurrences. An entity
+    that annotates the same visible URL is counted once.
+    """
+    text = text or ""
+    found: dict[tuple[int, int, str], str] = {}
+    for match in _URL_RE.finditer(text):
+        url = _clean_url(match.group(0))
+        start = len(text[:match.start()].encode("utf-16-le")) // 2
+        end = len(text[:match.start() + len(url)].encode("utf-16-le")) // 2
+        if url:
+            found.setdefault((start, end, _url_key(url)), url)
     for entity in entities or []:
         if isinstance(entity, MessageEntityTextUrl):
             url = _clean_url(entity.url)
@@ -48,8 +66,10 @@ def extract_urls(text: str | None, entities: list[object] | None = None) -> list
         else:
             continue
         if url:
-            found.setdefault(_url_key(url), url)
-    return list(found.values())
+            start = int(entity.offset)
+            end = start + int(entity.length)
+            found.setdefault((start, end, _url_key(url)), url)
+    return [(url, start, end) for (start, end, _key), url in sorted(found.items())]
 
 
 def contains_telegram_reference(text: str | None, urls: list[str]) -> bool:

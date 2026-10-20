@@ -38,7 +38,9 @@ from telegramlab.telegram.inspector import (
     InvalidCredentialsError,
     NetworkInspectionError,
     inspect_source,
+    normalize_target,
 )
+from telegramlab.telegram.explorer import ExplorationResult, explore_source
 
 _SECRET_PATTERNS = (
     re.compile(r"(?i)(api[_-]?hash|api[_-]?id|token|password|secret)\s*([=:])\s*([^\s,;]+)"),
@@ -96,6 +98,13 @@ def build_parser() -> argparse.ArgumentParser:
     inspect.add_argument("--limit", type=_inspection_limit, default=30, help="Recent messages to inspect (1–100, default 30)")
     inspect.add_argument("--save", action="store_true", help="Save metadata and aggregate summary in the source registry")
     inspect.add_argument("--json", action="store_true", help="Print structured JSON")
+
+    explore = commands.add_parser("explore", help="Explore references in one accessible Telegram source")
+    explore.add_argument("target", help="Public username or an already accessible marked dialog ID")
+    explore.add_argument("--limit", type=_inspection_limit, default=30,
+                         help="Recent messages to inspect (1–100, default 30)")
+    explore.add_argument("--save", action="store_true", help="Save candidates and reference provenance")
+    explore.add_argument("--json", action="store_true", help="Print structured JSON")
 
     source = commands.add_parser("source", help="Manage the local research source registry")
     actions = source.add_subparsers(dest="source_command", required=True)
@@ -257,6 +266,42 @@ async def _inspect_with_existing_session(target: str, limit: int, save: bool, re
                 pass
 
 
+async def _explore_with_existing_session(target: str, limit: int, save: bool, registry_path, progress):
+    normalized_target = normalize_target(target)
+    settings = Settings.from_env()
+    require_existing_session(settings.session_path)
+    if settings.api_id is None or not settings.api_hash:
+        raise InvalidCredentialsError("TG_API_ID and TG_API_HASH are required; no login prompt will be opened.")
+    try:
+        client = create_client(settings)
+    except MissingSessionError:
+        raise
+    except ValueError as error:
+        raise InvalidCredentialsError(str(error)) from None
+    connected = False
+    try:
+        await client.connect()
+        connected = True
+        if not await client.is_user_authorized():
+            raise InvalidCredentialsError("The existing Telegram session is not authorized; interactive login is disabled.")
+        return await explore_source(
+            client, normalized_target, limit=limit, progress=progress,
+            registry_path=registry_path, save=save,
+        )
+    except Exception as error:
+        if isinstance(error, (InspectionError, MissingSessionError)):
+            raise
+        from telegramlab.telegram.inspector import _raise_mapped_error
+        _raise_mapped_error(error)
+        raise InspectionError(f"Reference exploration failed ({type(error).__name__}).") from None
+    finally:
+        if connected:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+
+
 def _run_inspect(args: argparse.Namespace) -> int:
     progress = (lambda message: print(message, file=sys.stderr)) if args.json else print
     try:
@@ -322,6 +367,62 @@ def _run_inspect(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_explore(args: argparse.Namespace) -> int:
+    progress = (lambda message: print(message, file=sys.stderr)) if args.json else print
+    try:
+        result = asyncio.run(_explore_with_existing_session(
+            args.target, args.limit, args.save,
+            Settings.from_env().sources_database_path, progress,
+        ))
+    except (InspectionError, MissingSessionError, InvalidCredentialsError, NetworkInspectionError) as error:
+        if args.json:
+            print(to_json({
+                "source_identity": {"provider": "telegram", "requested": args.target},
+                "explored_at": datetime.now(UTC).isoformat(timespec="seconds"),
+                "limit": args.limit, "messages_inspected": 0,
+                "unique_references": 0, "total_occurrences": 0, "references": [],
+                "warnings": [str(error)], "completion_status": "failed",
+            }))
+        else:
+            print(f"Error: {error}", file=sys.stderr)
+        return 1
+    except Exception as error:
+        message = "Invalid Telegram configuration." if isinstance(error, (ValueError, OSError)) else f"Exploration failed ({type(error).__name__})."
+        if args.json:
+            print(to_json({
+                "source_identity": {"provider": "telegram", "requested": args.target},
+                "explored_at": datetime.now(UTC).isoformat(timespec="seconds"),
+                "limit": args.limit, "messages_inspected": 0,
+                "unique_references": 0, "total_occurrences": 0, "references": [],
+                "warnings": [message], "completion_status": "failed",
+            }))
+        else:
+            print(f"Error: {message}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(to_json(result.as_dict()))
+    else:
+        source_label = result.source_identity.get("title") or result.source_identity.get("username") or result.source_identity["telegram_id"]
+        print(f"Exploration complete: {source_label}")
+        print(f"Messages inspected: {result.messages_inspected} / {result.limit}")
+        print(f"Unique references: {result.unique_references}")
+        print(f"Total occurrences: {result.total_occurrences}")
+        for reference in result.references:
+            print(f"{reference['reference_type']}: {reference['normalized_target']} "
+                  f"(occurrences: {reference['occurrence_count']})")
+            for evidence in reference["provenance"]:
+                print(f"  source {evidence['origin_source_id']}, message {evidence['origin_message_id']}, "
+                      f"discovered {evidence['discovered_at']}")
+        if result.warnings:
+            print("Warnings:")
+            for warning in result.warnings:
+                print(f"- {warning}")
+        if result.registry_summary:
+            print(f"Candidate sources created: {result.registry_summary['candidate_sources_created']}")
+            print(f"Provenance records processed: {result.registry_summary['provenance_records_saved']}")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     configure_logging()
     parser = build_parser()
@@ -343,6 +444,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 2
     if args.command == "inspect":
         return _run_inspect(args)
+    if args.command == "explore":
+        return _run_explore(args)
     parser.print_help()
     return 0
 
