@@ -1,0 +1,30 @@
+# Telegram authentication and local research data
+*.session
+*.session-journal
+*.session-wal
+*.session-shm
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+
+# Environment secrets
+.env
+.env.*
+!.env.example
+
+# Python environments and generated files
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+build/
+dist/
