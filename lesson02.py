@@ -39,7 +39,8 @@ async def main():
                 "has_media": message.media is not None,
                 "views": message.views,
                 "forwards": message.forwards,
-                "links": links
+                "links": links,
+                "j":"kl"
             }
 
             print(json.dumps(
